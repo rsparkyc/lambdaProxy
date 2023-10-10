@@ -19,7 +19,6 @@ function censor(censor) {
 exports.handler = async (event, context) => {
   
   if (event.requestContext.http.method.toLowerCase() === 'options') {
-    console.log("handling options");
     return {
       statusCode: 200
     };
@@ -30,11 +29,6 @@ exports.handler = async (event, context) => {
   if (typeof eventData === 'string') {
     eventData = JSON.parse(eventData);
   }
-
-
-  console.log("EventData:" + JSON.stringify(eventData));
-  console.log("Request Type: " + eventData.method.toLowerCase());
-
   
   let url = eventData.url;
   if (!url) {
@@ -44,12 +38,9 @@ exports.handler = async (event, context) => {
     };
   }
 
-
   const rd = buildRequestData(eventData);
   
   if (eventData.method.toLowerCase() === 'get') {
-    console.log("Making get request to " + url);
-
     const sg = superagent.get(url).redirects(0);
     if (rd.headers) {
       for (const key of Object.keys(rd.headers)) {
@@ -57,40 +48,41 @@ exports.handler = async (event, context) => {
       }
     }
     
-    console.log("SG request:", JSON.stringify(sg, null, 2));
-
     return await sg
       .then(response => {
         return buildResponse(response);
       })
       .catch(error => {
         if (error.status === 302){
-          console.log("Redirected to: " + error.response.header.location);
           return buildResponse(error.response);
         }
         console.error('Error:', JSON.stringify(error, null, 2));
         return {
           statusCode: 500,
-          body: JSON.stringify({ error: 'Internal Server Error' })
+          body: JSON.stringify({ error: 'Internal Server Error', errorObj: error })
         };
       });
   }
 
-  console.log("Checking for post");
   if (eventData.method.toLowerCase() === 'post') {
-    console.log("Making post request to " + url);
-
     const sg = superagent.post(url).redirects(0);
+    let sendDataAsForm = true;
     if (rd.headers) {
       for (const key of Object.keys(rd.headers)) {
         sg.set(key, rd.headers[key]);
+        if (key.toLowerCase() === 'content-type' && rd.headers[key].toLowerCase().includes('json')) {
+          sendDataAsForm = false;
+        }
       }
     }
     if (rd.data) {
-      sg.query(rd.data)
+      if (sendDataAsForm) {
+        sg.query(rd.data);
+      }
+      else {
+        sg.send(rd.data);
+      }
     }
-
-    console.log("SG request:", JSON.stringify(sg, null, 2));
 
     return await sg
       .then(response => {
@@ -98,19 +90,17 @@ exports.handler = async (event, context) => {
       })
       .catch(error => {
         if (error.status === 302){
-          console.log("Redirected to: " + error.response.header.location);
           return buildResponse(error.response);
         }
         console.error('Error:', error);
         return {
           statusCode: 500,
-          body: JSON.stringify({ error: 'Internal Server Error' })
+          body: JSON.stringify({ error: 'Internal Server Error', errorObj: error })
         };
       });
   }
   
-  console.log("No methods matched");
-  
+  console.error("No methods matched");
 }
 
 // This is for axios, but we can still use the data it makes for us
@@ -125,7 +115,6 @@ function buildRequestData(eventData) {
       else {
         // dealing with stupid cookies
         
-        console.log("About to parse: " + eventData.headers['x-c-data']);
         const XCData = JSON.parse(eventData.headers['x-c-data']);
         
         let cookieString = "";
@@ -134,7 +123,6 @@ function buildRequestData(eventData) {
           if (cookieString.length > 0) {
             cookieString += ";";
           }
-          console.log("Adding cookie: " + cookie);
           cookieString += cookie;
         }
         config.headers.Cookie = cookieString;
@@ -146,14 +134,10 @@ function buildRequestData(eventData) {
     config.data = eventData.data;
   }
   
-  //config.maxRedirects = 0;
-  
-  console.log("Request config: " + JSON.stringify(config));
   return config;
 }
 
 function buildResponse(response){
-  console.log('Response: ' + JSON.stringify(response, censor(response)));
   // remove any extra cors headers
   delete response.header['access-control-allow-origin'];
   delete response.header['access-control-allow-credentials'];
@@ -169,18 +153,11 @@ function buildResponse(response){
   };
   if (responseObj.statusCode == 302) {
     responseObj.statusCode = 200; // Let's not make the browser follow the redirect, we'll just look for the location header
-    //responseObj.headers['x-location'] = response.header.location;
   }
   let cookieHeader = response.header['set-cookie'];
   if (cookieHeader !== undefined){
-    console.log("got following cookie header: " + cookieHeader);
     responseObj.headers['x-c-data'] = cookieHeader;
   }
-  else {
-    console.log("got no cookie header");
-  }
-  
-  console.log("ResponseObj: " + JSON.stringify(responseObj, null, 2));
   
   return responseObj;
 }
