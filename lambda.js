@@ -1,167 +1,146 @@
-const superagent = require("superagent");
+// BSF CORS proxy. Dependency-free (Node 22 built-in fetch + zlib) to keep
+// cold starts small. Behavior intentionally matches the previous superagent
+// version, including its quirks, because the web app's login flow relies on them:
+//   - redirects are not followed; a 302 is returned as 200 with its location header
+//   - Set-Cookie values are exposed as `x-c-data: [cookie1, cookie2]`
+//   - an `x-c-data` request header (JSON array of cookies) becomes a Cookie header
+//   - non-JSON POST data is sent as the URL query string, with an empty body
+//   - any other non-2xx upstream status becomes a 500 with `errorObj`
+// New: responses are gzip-compressed when the client accepts it.
 
-function censor(censor) {
-  var i = 0;
+const zlib = require("zlib");
 
-  return function (key, value) {
-    if (i !== 0 && typeof censor === "object" && typeof value == "object" && censor == value) return "[Circular]";
+const STRIPPED_RESPONSE_HEADERS = new Set([
+  "access-control-allow-origin",
+  "access-control-allow-credentials",
+  "access-control-allow-headers",
+  "content-encoding", // fetch already decoded the body
+  "content-length",
+  "transfer-encoding",
+  "connection",
+  "set-cookie", // exposed via x-c-data instead
+]);
 
-    if (i >= 49)
-      // seems to be a harded maximum of 30 serialized objects?
-      return "[Unknown]";
+const MIN_COMPRESS_BYTES = 1024;
 
-    ++i; // so we know we aren't using the original object anymore
-
-    return value;
-  };
-}
-
-exports.handler = async (event, context) => {
+exports.handler = async (event) => {
   if (event.requestContext.http.method.toLowerCase() === "options") {
-    return {
-      statusCode: 200,
-    };
+    return { statusCode: 200 };
   }
 
   let eventData = event.body;
-
+  if (event.isBase64Encoded && typeof eventData === "string") {
+    eventData = Buffer.from(eventData, "base64").toString("utf8");
+  }
   if (typeof eventData === "string") {
     eventData = JSON.parse(eventData);
   }
 
-  let url = eventData.url;
+  let url = eventData?.url;
   if (!url) {
+    url = event.queryStringParameters?.url;
+    if (!url) {
+      return { statusCode: 400, body: JSON.stringify({ error: "Missing URL parameter" }) };
+    }
+    eventData = { url, method: "get" };
+  }
+
+  const method = (eventData.method || "get").toUpperCase();
+  if (method !== "GET" && method !== "POST") {
+    console.error("No methods matched");
+    return { statusCode: 400, body: JSON.stringify({ error: "Unsupported method" }) };
+  }
+
+  const headers = buildRequestHeaders(eventData.headers);
+  const init = { method, headers, redirect: "manual" };
+
+  if (method === "POST" && eventData.data != null) {
+    const isJson = Object.entries(headers).some(
+      ([k, v]) => k.toLowerCase() === "content-type" && String(v).toLowerCase().includes("json")
+    );
+    if (isJson) {
+      init.body = typeof eventData.data === "string" ? eventData.data : JSON.stringify(eventData.data);
+    } else {
+      url = appendQuery(url, eventData.data);
+    }
+  }
+
+  let response;
+  try {
+    response = await fetch(url, init);
+  } catch (error) {
+    console.error("Fetch error:", error.message);
     return {
-      statusCode: 400,
-      body: JSON.stringify({ error: "Missing URL parameter" }),
+      statusCode: 500,
+      body: JSON.stringify({ error: "Internal Server Error", errorObj: { message: error.message } }),
     };
   }
 
-  const rd = buildRequestData(eventData);
+  const ok = (response.status >= 200 && response.status < 300) || response.status === 302;
+  const text = await response.text();
 
-  if (eventData.method.toLowerCase() === "get") {
-    const sg = superagent.get(url).redirects(0);
-    if (rd.headers) {
-      for (const key of Object.keys(rd.headers)) {
-        sg.set(key, rd.headers[key]);
-      }
-    }
-
-    return await sg
-      .then((response) => {
-        return buildResponse(response);
-      })
-      .catch((error) => {
-        if (error.status === 302) {
-          return buildResponse(error.response);
-        }
-        console.error("Error:", JSON.stringify(error, null, 2));
-        return {
-          statusCode: 500,
-          body: JSON.stringify({ error: "Internal Server Error", errorObj: error }),
-        };
-      });
+  if (!ok) {
+    return {
+      statusCode: 500,
+      body: JSON.stringify({
+        error: "Internal Server Error",
+        errorObj: { status: response.status, response: { text } },
+      }),
+    };
   }
 
-  if (eventData.method.toLowerCase() === "post") {
-    const sg = superagent.post(url).redirects(0);
-    let sendDataAsForm = true;
-    if (rd.headers) {
-      for (const key of Object.keys(rd.headers)) {
-        sg.set(key, rd.headers[key]);
-        if (key.toLowerCase() === "content-type" && rd.headers[key].toLowerCase().includes("json")) {
-          sendDataAsForm = false;
-        }
-      }
-    }
-    if (rd.data) {
-      if (sendDataAsForm) {
-        sg.query(rd.data);
-      } else {
-        sg.send(rd.data);
-      }
-    }
-
-    return await sg
-      .then((response) => {
-        return buildResponse(response);
-      })
-      .catch((error) => {
-        if (error.status === 302) {
-          return buildResponse(error.response);
-        }
-        console.error("Error:", error);
-        return {
-          statusCode: 500,
-          body: JSON.stringify({ error: "Internal Server Error", errorObj: error }),
-        };
-      });
-  }
-
-  console.error("No methods matched");
+  return buildResponse(response, text, event.headers || {});
 };
 
-// This is for axios, but we can still use the data it makes for us
-function buildRequestData(eventData) {
-  let config = {};
-  if (eventData.headers) {
-    config.headers = {};
-    for (const key of Object.keys(eventData.headers)) {
-      if (key !== "x-c-data") {
-        config.headers[key] = eventData.headers[key];
-      } else {
-        // dealing with stupid cookies
-
-        const XCData = JSON.parse(eventData.headers["x-c-data"]);
-
-        let cookieString = "";
-
-        for (const cookie of XCData) {
-          if (cookieString.length > 0) {
-            cookieString += ";";
-          }
-          cookieString += cookie;
-        }
-        config.headers.Cookie = cookieString;
-      }
+function buildRequestHeaders(input) {
+  const headers = {};
+  if (!input) return headers;
+  for (const key of Object.keys(input)) {
+    if (key === "x-c-data") {
+      headers.Cookie = JSON.parse(input[key]).join(";");
+    } else {
+      headers[key] = input[key];
     }
   }
-
-  if (eventData.data) {
-    config.data = eventData.data;
-  }
-
-  return config;
+  return headers;
 }
 
-function buildResponse(response) {
-  // remove any extra cors headers
-  delete response.header["access-control-allow-origin"];
-  delete response.header["access-control-allow-credentials"];
-  delete response.header["access-control-allow-headers"];
-  if (response.header["content-encoding"] && response.header["content-encoding"] === "gzip") {
-    delete response.header["content-encoding"];
+function appendQuery(url, data) {
+  const qs = typeof data === "string" ? data : new URLSearchParams(data).toString();
+  if (!qs) return url;
+  return url + (url.includes("?") ? "&" : "?") + qs;
+}
+
+function buildResponse(response, text, requestHeaders) {
+  const headers = {};
+  for (const [key, value] of response.headers) {
+    if (!STRIPPED_RESPONSE_HEADERS.has(key)) headers[key] = value;
   }
 
-  let responseObj = {
-    statusCode: response.status,
-    headers: response.header,
-    body: response.text,
-  };
-  if (responseObj.statusCode == 302) {
-    responseObj.statusCode = 200; // Let's not make the browser follow the redirect, we'll just look for the location header
-  }
-  let cookieHeader = response.header["set-cookie"];
-  if (cookieHeader !== undefined) {
-    responseObj.headers["x-c-data"] = cookieHeader;
-  }
-  if (responseObj.headers["content-disposition"]) {
-    // replace attachment with inline
-    responseObj.headers["content-disposition"] = responseObj.headers["content-disposition"].replace(
-      "attachment",
-      "inline"
-    );
+  const cookies = response.headers.getSetCookie();
+  if (cookies.length > 0) {
+    // Same format Lambda produced for the old array-valued header.
+    headers["x-c-data"] = `[${cookies.join(", ")}]`;
   }
 
-  return responseObj;
+  if (headers["content-disposition"]) {
+    headers["content-disposition"] = headers["content-disposition"].replace("attachment", "inline");
+  }
+
+  // Let the browser follow nothing; the client reads the location header.
+  const statusCode = response.status === 302 ? 200 : response.status;
+
+  const acceptEncoding = String(requestHeaders["accept-encoding"] || "");
+  if (/\bgzip\b/.test(acceptEncoding) && Buffer.byteLength(text) >= MIN_COMPRESS_BYTES) {
+    headers["content-encoding"] = "gzip";
+    headers["vary"] = "accept-encoding";
+    return {
+      statusCode,
+      headers,
+      body: zlib.gzipSync(text, { level: 6 }).toString("base64"),
+      isBase64Encoded: true,
+    };
+  }
+
+  return { statusCode, headers, body: text };
 }

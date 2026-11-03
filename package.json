@@ -1,5 +1,4 @@
 {
-  "dependencies": {
-    "superagent": "^8.1.2"
-  }
+  "private": true,
+  "description": "BSF CORS proxy (no dependencies; Node 22 built-in fetch)"
 }
